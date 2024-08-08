@@ -28,7 +28,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	_ = shmaddr
+	defer shm.Dt(shmaddr)
+	defer shm.Ctl(shmid, shm.IPC_RMID, nil)
 
 	for i := range height {
 		for j := range width {
@@ -219,7 +220,6 @@ recv:
 				print(hex.Dump(msg))
 			}
 		}
-
 	}
 }
 
