@@ -6,10 +6,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"syscall"
+	"unsafe"
 
 	"github.com/dzeromsk/helloX11/x11byte"
-
-	"github.com/gen2brain/shm"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -18,29 +19,6 @@ const (
 )
 
 func main() {
-	// Prepare Image
-	shmid, err := shm.Get(shm.IPC_PRIVATE, width*height*4, shm.IPC_CREAT|0600)
-	if err != nil {
-		panic(err)
-	}
-
-	shmaddr, err := shm.At(shmid, 0, 0)
-	if err != nil {
-		panic(err)
-	}
-	defer shm.Dt(shmaddr)
-	defer shm.Ctl(shmid, shm.IPC_RMID, nil)
-
-	for i := range height {
-		for j := range width {
-			offset := (i*width + j) * 4
-			shmaddr[offset+0] = uint8(i / 4 % 256)
-			shmaddr[offset+1] = uint8(j / 4 % 256)
-			shmaddr[offset+2] = 0x00
-			shmaddr[offset+3] = 0x00
-		}
-	}
-
 	conn, err := net.Dial("unix", "/tmp/.X11-unix/X0")
 	// conn, err := net.Dial("tcp4", "127.0.0.1:6000")
 	if err != nil {
@@ -62,13 +40,69 @@ func main() {
 	wmProtocols, wmDeleteWindow := uint32(441), uint32(439)
 	// println(wmProtocols, wmDeleteWindow)
 
-	// TODO(dzeromsk): verify mitshmOpcode is static
-	// mitshmOpcode, err := mitshmExtension(conn)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	mitshmOpcode := uint8(130)
-	// println(mitshmOpcode)
+	// presentOpcode, _ := presentExtension(conn)
+	presentOpcode := uint8(148)
+	println("present:", presentOpcode)
+
+	// dri3Opcode, _ := dri3Extension(conn)
+	dri3Opcode := uint8(149)
+	println("dri3:", dri3Opcode)
+
+	pixmapID := nextID()
+	pfd, err := pixmap(conn, pixmapID, parentID, dri3Opcode)
+	if err != nil {
+		panic(err)
+	}
+
+	pdata, err := unix.Mmap(int(pfd), 0, width*height*4, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		panic(err)
+	}
+	defer unix.Munmap(pdata)
+
+	var sync dma_buf_sync
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(pfd), DMA_BUF_IOCTL_SYNC, uintptr(unsafe.Pointer(&sync)))
+	if errno != 0 {
+		panic(errno)
+	}
+
+	for i := range pdata {
+		pdata[i] = 0xff
+	}
+
+	// 128x8=4096(1page)
+
+	fill := func(block int) {
+		offset := block * 4096
+		for y := 0; y < 8*4; y += 4 {
+			for x := 0; x < 128*4; x += 4 {
+				pdata[offset+y*128+x+0] = 0x00
+				pdata[offset+y*128+x+1] = 0x00
+				pdata[offset+y*128+x+2] = 0x00
+
+			}
+		}
+	}
+
+	for by := range 128 {
+		for bx := range 8 {
+			if bx != 2 {
+				continue
+			}
+			if by < 64 || by > 78 {
+				continue
+			}
+			block := by*8 + bx
+			fill(block)
+		}
+	}
+
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE
+	_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(pfd), DMA_BUF_IOCTL_SYNC, uintptr(unsafe.Pointer(&sync)))
+	if errno != 0 {
+		panic(errno)
+	}
 
 	var b x11byte.Builder
 
@@ -93,17 +127,6 @@ func main() {
 	b.AddUint32(0x00000000)                                     // backgroundPixel
 	b.AddUint32(X11_EVENT_FLAG_EXPOSURE)                        // windowEvents
 
-	shmID := nextID()
-
-	// MIT-SHM Attach, to avoid image data copy
-	b.AddUint8(mitshmOpcode)   // opcode
-	b.AddUint8(1)              // extension-minor, attach
-	b.AddUint16(4)             // requestLength
-	b.AddUint32(shmID)         // shmseg
-	b.AddUint32(uint32(shmid)) // shmid
-	b.AddUint8(0)              // read only
-	b.AddUint24(0)             // unused
-
 	// Change Property, to let know WM that we support delete window
 	b.AddUint8(X11_REQUEST_CHANGE_PROPERTY) // opcode
 	b.AddUint8(0)                           // mode
@@ -116,16 +139,31 @@ func main() {
 	b.AddUint32(1)                          // dataLength
 	b.AddUint32(wmDeleteWindow)             // data
 
-	gcID := nextID()
+	var serial uint32
 
-	// Create GC, needed by mit-shm PutImage
-	b.AddUint8(X11_REQUEST_CREATE_GC)   // opcode
-	b.AddUint8(0)                       // unused
-	b.AddUint16(5)                      // requestLength
-	b.AddUint32(gcID)                   // cid
-	b.AddUint32(windowID)               // drawable
-	b.AddUint32(X11_GC_FLAG_BACKGROUND) // gcValueMask
-	b.AddUint32(0x00000000)             // background
+	// Present Pixmap
+	b.AddUint8(presentOpcode) // opcode
+	b.AddUint8(1)             // extension-minor, present
+	b.AddUint16(0x12)         // requestLength
+	b.AddUint32(windowID)     // window
+	b.AddUint32(pixmapID)     // pixmap
+	b.AddUint32(serial)       // serial
+	b.AddUint32(0)            // valid
+	b.AddUint32(0)            // update
+	b.AddUint16(0)            // x_off
+	b.AddUint16(0)            // y_off
+	b.AddUint32(0)            // target_crtc
+	b.AddUint32(0)            // wait_fence
+	b.AddUint32(0)            // idle_fence
+	b.AddUint32(8)            // options
+	b.AddUint32(0)            // unused
+	// b.AddUint32(0x0356a519) // target_msc
+	b.AddUint32(0) // target_msc
+	b.AddUint32(0) // target_msc
+	b.AddUint32(0) // divisor
+	b.AddUint32(0) // divisor
+	b.AddUint32(0) // remainder
+	b.AddUint32(0) // remainder
 
 	// Map window, required
 	b.AddUint8(X11_REQUEST_MAP_WINDOW) // opcode
@@ -175,35 +213,38 @@ recv:
 				// println(x, y, w, h)
 
 				var r x11byte.Builder
-				dstx, dsty := max((int(w)-width)/2, 0), max((int(h)-height)/2, 0)
-				// MIT-SHM PutImage
-				r.AddUint8(mitshmOpcode) // opcode
-				r.AddUint8(3)            // extension-minor, PutImage
-				r.AddUint16(10)          // requestLength
-				r.AddUint32(windowID)    // drawable
-				r.AddUint32(gcID)        // gc
-				r.AddUint16(width)       // totalWidth
-				r.AddUint16(height)      // totalHeight
-				r.AddUint16(0)           // srcX
-				r.AddUint16(0)           // srcY
-				r.AddUint16(width)       // srcWidth
-				r.AddUint16(height)      // srcHeight
-				// r.AddUint16(0)           // dstX
-				// r.AddUint16(0)           // dstY
-				r.AddUint16(uint16(dstx)) // dstX
-				r.AddUint16(uint16(dsty)) // dstY
-				r.AddUint8(24)            // depth
-				r.AddUint8(2)             // format
-				r.AddUint8(0)             // sendEvent
-				r.AddUint8(0)             // unused
-				r.AddUint32(shmID)        // shmseg
-				r.AddUint32(0)            // offset
 
-				put := r.BytesOrPanic()
+				// Present Pixmap
+				r.AddUint8(presentOpcode) // opcode
+				r.AddUint8(1)             // extension-minor, present
+				r.AddUint16(0x12)         // requestLength
+				r.AddUint32(windowID)     // window
+				r.AddUint32(pixmapID)     // pixmap
+				r.AddUint32(serial)       // serial
+				r.AddUint32(0)            // valid
+				r.AddUint32(0)            // update
+				r.AddUint16(0)            // x_off
+				r.AddUint16(0)            // y_off
+				r.AddUint32(0)            // target_crtc
+				r.AddUint32(0)            // wait_fence
+				r.AddUint32(0)            // idle_fence
+				r.AddUint32(8)            // options
+				r.AddUint32(0)            // unused
+				// r.AddUint32(0x0356a519) // target_msc
+				r.AddUint32(0) // target_msc
+				r.AddUint32(0) // target_msc
+				r.AddUint32(0) // divisor
+				r.AddUint32(0) // divisor
+				r.AddUint32(0) // remainder
+				r.AddUint32(0) // remainder
 
-				if _, err := conn.Write(put); err != nil {
+				present := r.BytesOrPanic()
+				if _, err := conn.Write(present); err != nil {
 					panic(err)
 				}
+
+				serial++
+
 			case 161: // Client Message, maybe vmDeleteWindow from Window Manager
 				msg.Skip(1) // eventCode
 				msg.Skip(1) // format
@@ -249,6 +290,7 @@ const (
 	X11_REQUEST_MAP_WINDOW      = 8
 	X11_REQUEST_INTERN_ATOM     = 16
 	X11_REQUEST_CHANGE_PROPERTY = 18
+	X11_REQUEST_CREATE_PIXMAP   = 53
 	X11_REQUEST_CREATE_GC       = 55
 	X11_REQUEST_QUERY_EXTENSION = 98
 )
@@ -408,7 +450,7 @@ func authenticate(conn net.Conn) (func() uint32, uint32, uint32, error) {
 // 	return atoms[0], atoms[1], nil
 // }
 
-// func mitshmExtension(conn net.Conn) (uint8, error) {
+// func presentExtension(conn net.Conn) (uint8, error) {
 // 	var b x11byte.Builder
 
 // 	b.AddUint8(X11_REQUEST_QUERY_EXTENSION) // opcode
@@ -416,7 +458,7 @@ func authenticate(conn net.Conn) (func() uint32, uint32, uint32, error) {
 // 	b.AddUint16(4)                          // requestLength
 // 	b.AddUint16(7)                          // nameLength
 // 	b.AddUint16(0)                          // unused
-// 	b.AddBytes([]byte("MIT-SHM"))           // name
+// 	b.AddBytes([]byte("Present"))           // name
 // 	b.AddUint8(1)                           // unused
 
 // 	if _, err := conn.Write(b.BytesOrPanic()); err != nil {
@@ -447,3 +489,152 @@ func authenticate(conn net.Conn) (func() uint32, uint32, uint32, error) {
 
 // 	return majorOpcode, nil
 // }
+
+// func dri3Extension(conn net.Conn) (uint8, error) {
+// 	var b x11byte.Builder
+
+// 	b.AddUint8(X11_REQUEST_QUERY_EXTENSION) // opcode
+// 	b.AddUint8(1)                           // extension-minor, attach
+// 	b.AddUint16(3)                          // requestLength
+// 	b.AddUint16(4)                          // nameLength
+// 	b.AddUint16(0)                          // unused
+// 	b.AddBytes([]byte("DRI3"))              // name
+// 	// b.AddUint8(4)                           // unused
+
+// 	if _, err := conn.Write(b.BytesOrPanic()); err != nil {
+// 		return 0, err
+// 	}
+
+// 	header := x11byte.String(make([]byte, 32))
+// 	if _, err := io.ReadFull(conn, header); err != nil {
+// 		return 0, err
+// 	}
+
+// 	var (
+// 		reply          uint8
+// 		sequenceNumber uint16
+// 		replayLength   uint32
+// 		present        uint8
+// 		majorOpcode    uint8
+// 	)
+
+// 	header.ReadUint8(&reply)
+// 	header.Skip(1)
+// 	header.ReadUint16(&sequenceNumber)
+// 	header.ReadUint32(&replayLength)
+// 	header.ReadUint8(&present)
+// 	header.ReadUint8(&majorOpcode)
+// 	header.Skip(1)
+// 	header.Skip(1)
+
+// 	return majorOpcode, nil
+// }
+
+func pixmap(conn net.Conn, pixmapID, parentID uint32, dri3Opcode uint8) (int, error) {
+	var b x11byte.Builder
+
+	b.AddUint8(X11_REQUEST_CREATE_PIXMAP) // opcode
+	b.AddUint8(24)                        // depth
+	b.AddUint16(4)                        // requestLength
+	b.AddUint32(pixmapID)                 // pid
+	b.AddUint32(parentID)                 // drawable
+	b.AddUint16(width)                    // width
+	b.AddUint16(height)                   // height
+
+	// // DRI3 Open
+	// b.AddUint8(dri3Opcode) // opcode
+	// b.AddUint8(1)          // extension-minor
+	// b.AddUint16(3)         // requestLength
+	// b.AddUint32(parentID)  // drawable
+	// b.AddUint32(0)         // provider
+
+	// DRI3 BufferFromPixmap
+	b.AddUint8(dri3Opcode) // opcode
+	b.AddUint8(3)          // extension-minor
+	b.AddUint16(2)         // requestLength
+	b.AddUint32(pixmapID)  // pixmap
+
+	if _, err := conn.Write(b.BytesOrPanic()); err != nil {
+		return 0, err
+	}
+
+	var fd uint32
+	reply := x11byte.String(make([]byte, 1024))
+
+	num := 4
+
+	viaf, err := conn.(*net.UnixConn).File()
+	if err != nil {
+		return 0, err
+	}
+	socket := int(viaf.Fd())
+	defer viaf.Close()
+
+	control := make([]byte, syscall.CmsgSpace(num*4))
+	_, _, _, _, err = syscall.Recvmsg(socket, reply, control, 0)
+	if err != nil {
+		return 0, err
+	}
+
+	// parse control msgs
+	var msgs []syscall.SocketControlMessage
+	msgs, err = syscall.ParseSocketControlMessage(control)
+	if err != nil {
+		return 0, err
+	}
+
+	fds := x11byte.String(msgs[0].Data)
+	fds.ReadUint32(&fd)
+
+	var (
+		typ            uint8 // 1: reply
+		nfd            uint8
+		sequenceNumber uint16
+		replayLength   uint32
+	)
+
+	reply.ReadUint8(&typ)
+	reply.ReadUint8(&nfd)
+	reply.ReadUint16(&sequenceNumber)
+	reply.ReadUint32(&replayLength)
+
+	println("reply", typ, nfd, sequenceNumber, replayLength)
+
+	var (
+		size   uint32
+		width  uint16
+		height uint16
+		stride uint16
+		depth  uint8
+		bpp    uint8
+		// fd     [3]uint32
+	)
+
+	reply.ReadUint32(&size)
+	reply.ReadUint16(&width)
+	reply.ReadUint16(&height)
+	reply.ReadUint16(&stride)
+	reply.ReadUint8(&depth)
+	reply.ReadUint8(&bpp)
+
+	println("reply2", size, width, height, depth, bpp, stride)
+
+	println("done", fd)
+	return int(fd), nil
+}
+
+const (
+	DMA_BUF_IOCTL_SYNC = 0x40086200
+
+	DMA_BUF_SYNC_READ             = 0x1 // Indicates that the mapped DMA buffer will be read by the client via the CPU map.
+	DMA_BUF_SYNC_WRITE            = 0x2 // Indicates that the mapped DMA buffer will be written by the client via the CPU map.
+	DMA_BUF_SYNC_RW               = 0x3 // An alias for DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE.
+	DMA_BUF_SYNC_START            = 0x0 // Indicates the start of a map access session.
+	DMA_BUF_SYNC_END              = 0x4 // Indicates the end of a map access session.
+	DMA_BUF_SYNC_VALID_FLAGS_MASK = 0x7
+	DMA_BUF_NAME_LEN              = 0x20
+)
+
+type dma_buf_sync struct {
+	flags uint64
+}
